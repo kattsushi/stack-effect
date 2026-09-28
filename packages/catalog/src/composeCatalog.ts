@@ -1,4 +1,11 @@
-import { CatalogFragment, CatalogValidationError } from "@repo/domain/Catalog";
+import {
+  CatalogFragment,
+  type CatalogIssue,
+  type CatalogIssueCode,
+  type CatalogIssueSubject,
+  CatalogValidationError,
+  catalogIssueLabel,
+} from "@repo/domain/Catalog";
 import { Array as Arr, Effect, Schema } from "effect";
 
 /** Validate fragments separately, then resolve references against their union. */
@@ -11,7 +18,14 @@ export const composeCatalog = Effect.fn("Catalog.compose")(function* (
       Effect.mapError(
         (error) =>
           new CatalogValidationError({
-            issues: [`Fragment ${index}: ${error.message}`],
+            details: [
+              {
+                subject: { _tag: "document" },
+                code: "invalid-shape",
+                message: `Fragment ${index}: ${error.message}`,
+                fragment: index,
+              },
+            ],
           }),
       ),
     ),
@@ -24,18 +38,37 @@ export const composeCatalog = Effect.fn("Catalog.compose")(function* (
   const moduleById = new Map<string, (typeof modules)[number]>(
     modules.map((module) => [module.id, module]),
   );
-  const issues: Array<string> = [];
+  const issues: Array<CatalogIssue> = [];
+  const moduleSubject = (id: string): CatalogIssueSubject => ({
+    _tag: "module",
+    id,
+  });
+  const targetSubject = (kind: string): CatalogIssueSubject => ({
+    _tag: "target",
+    kind,
+  });
+  const report = (
+    subject: CatalogIssueSubject,
+    code: CatalogIssueCode,
+    message: string,
+  ) => issues.push({ subject, code, message });
 
   const duplicates = (ids: ReadonlyArray<string>) =>
     ids.filter((id, index) => ids.indexOf(id) !== index);
   issues.push(
     ...duplicates(targets.map((target) => target.kind)).map(
-      (kind) => `Duplicate target kind ${kind}`,
+      (kind): CatalogIssue => ({
+        subject: targetSubject(kind),
+        code: "duplicate-id",
+        message: `Duplicate target kind ${kind}`,
+      }),
     ),
-  );
-  issues.push(
     ...duplicates(modules.map((module) => module.id)).map(
-      (id) => `Duplicate module ID ${id}`,
+      (id): CatalogIssue => ({
+        subject: moduleSubject(id),
+        code: "duplicate-id",
+        message: `Duplicate module ID ${id}`,
+      }),
     ),
   );
 
@@ -43,31 +76,42 @@ export const composeCatalog = Effect.fn("Catalog.compose")(function* (
     module.supportedOn.some(
       (rule) => rule._tag === "kind" && rule.kind === kind,
     );
-  const requireTarget = (kind: string, owner: string) => {
+  const requireTarget = (kind: string, owner: CatalogIssueSubject) => {
     if (!targetByKind.has(kind))
-      issues.push(`${owner} references missing target ${kind}`);
+      report(
+        owner,
+        "missing-reference",
+        `${catalogIssueLabel(owner)} references missing target ${kind}`,
+      );
   };
-  const requireModule = (id: string, owner: string) => {
+  const requireModule = (id: string, owner: CatalogIssueSubject) => {
     if (!moduleById.has(id))
-      issues.push(`${owner} references missing module ${id}`);
+      report(
+        owner,
+        "missing-reference",
+        `${catalogIssueLabel(owner)} references missing module ${id}`,
+      );
   };
 
   for (const target of targets) {
     for (const id of target.requiredModules ?? []) {
-      requireModule(id, `Target ${target.kind}`);
+      requireModule(id, targetSubject(target.kind));
       const required = moduleById.get(id);
       if (required && !supports(required, target.kind)) {
-        issues.push(
+        report(
+          targetSubject(target.kind),
+          "unsupported-target",
           `Target ${target.kind} requires module ${id} on another target`,
         );
       }
     }
   }
   for (const module of modules) {
+    const owner = moduleSubject(module.id);
     for (const rule of module.supportedOn) {
       requireTarget(
         rule._tag === "kind" ? rule.kind : rule.identity.kind,
-        `Module ${module.id}`,
+        owner,
       );
     }
     for (const dependency of module.dependencies) {
@@ -75,15 +119,17 @@ export const composeCatalog = Effect.fn("Catalog.compose")(function* (
         dependency._tag === "required-target"
           ? dependency.identity
           : dependency.target;
-      requireTarget(target.kind, `Module ${module.id}`);
+      requireTarget(target.kind, owner);
       if (dependency._tag === "required-module") {
-        requireModule(dependency.moduleId, `Module ${module.id}`);
+        requireModule(dependency.moduleId, owner);
         const required = moduleById.get(dependency.moduleId);
         if (
           required &&
           !required.supportedOn.some((rule) => target.matches(rule))
         )
-          issues.push(
+          report(
+            owner,
+            "unsupported-target",
             `Module ${module.id} requires ${dependency.moduleId} on an unsupported target`,
           );
       }
@@ -95,21 +141,25 @@ export const composeCatalog = Effect.fn("Catalog.compose")(function* (
             candidate.supportedOn.some((rule) => target.matches(rule)),
         )
       )
-        issues.push(
+        report(
+          owner,
+          "unavailable-capability",
           `Module ${module.id} requires unavailable capability ${dependency.capability}`,
         );
     }
     for (const implication of module.implies ?? []) {
-      requireTarget(implication.targetKind, `Module ${module.id}`);
-      requireModule(implication.moduleId, `Module ${module.id}`);
+      requireTarget(implication.targetKind, owner);
+      requireModule(implication.moduleId, owner);
       const implied = moduleById.get(implication.moduleId);
       if (implied && !supports(implied, implication.targetKind))
-        issues.push(
+        report(
+          owner,
+          "unsupported-target",
           `Module ${module.id} implies ${implication.moduleId} on an unsupported target`,
         );
     }
     for (const child of module.children ?? []) {
-      requireModule(child.moduleId, `Module ${module.id}`);
+      requireModule(child.moduleId, owner);
       const definition = moduleById.get(child.moduleId);
       if (
         definition &&
@@ -126,29 +176,51 @@ export const composeCatalog = Effect.fn("Catalog.compose")(function* (
           }),
         )
       )
-        issues.push(
+        report(
+          owner,
+          "unsupported-target",
           `Module ${module.id} has child ${child.moduleId} on another target`,
         );
     }
     for (const conflict of module.conflictsWith ?? []) {
-      requireModule(conflict, `Module ${module.id}`);
+      requireModule(conflict, owner);
       if (
         moduleById.has(conflict) &&
         !moduleById.get(conflict)?.conflictsWith?.includes(module.id)
       )
-        issues.push(
+        report(
+          owner,
+          "asymmetric-conflict",
           `Module ${module.id} has asymmetric conflict with ${conflict}`,
         );
     }
   }
-  decoded.forEach((fragment, index) => {
-    if (index === options.trustedFragmentIndex) return;
-    for (const definition of [...fragment.targets, ...fragment.modules]) {
-      if (definition.scripts?.length)
-        issues.push(`Fragment ${index} contains Finalize scripts`);
-    }
-  });
+  issues.push(
+    ...decoded.flatMap((fragment, index): ReadonlyArray<CatalogIssue> =>
+      index === options.trustedFragmentIndex
+        ? []
+        : [
+            ...fragment.targets
+              .filter((target) => target.scripts?.length)
+              .map((target) => ({
+                subject: targetSubject(target.kind),
+                code: "finalize-script" as const,
+                message: `Fragment ${index} target ${target.kind} contains Finalize scripts`,
+                fragment: index,
+              })),
+            ...fragment.modules
+              .filter((module) => module.scripts?.length)
+              .map((module) => ({
+                subject: moduleSubject(module.id),
+                code: "finalize-script" as const,
+                message: `Fragment ${index} module ${module.id} contains Finalize scripts`,
+                fragment: index,
+              })),
+          ],
+    ),
+  );
 
-  if (issues.length) return yield* new CatalogValidationError({ issues });
+  if (issues.length)
+    return yield* new CatalogValidationError({ details: issues });
   return { targets, modules } as const;
 });

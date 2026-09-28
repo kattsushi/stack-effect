@@ -386,9 +386,63 @@ export const CatalogDocument = Schema.Struct({
 
 export type CatalogDocument = typeof CatalogDocument.Type;
 
+/** The Catalog definition an issue belongs to, so authoring tools can locate it. */
+export const CatalogIssueSubject = Schema.TaggedUnion({
+  module: { id: Schema.String },
+  target: { kind: Schema.String },
+  document: {},
+});
+export type CatalogIssueSubject = typeof CatalogIssueSubject.Type;
+
+/** Human label for an issue subject, as used in validation messages. */
+export const catalogIssueLabel = (subject: CatalogIssueSubject): string =>
+  CatalogIssueSubject.match(subject, {
+    module: ({ id }) => `Module ${id}`,
+    target: ({ kind }) => `Target ${kind}`,
+    document: () => "Catalog",
+  });
+
+/** Stable key identifying the definition an issue subject names. */
+export const catalogIssueKey = (subject: CatalogIssueSubject): string =>
+  CatalogIssueSubject.match(subject, {
+    module: ({ id }) => `module:${id}`,
+    target: ({ kind }) => `target:${kind}`,
+    document: () => "document",
+  });
+
+export const CatalogIssueCode = Schema.Literals([
+  "invalid-shape",
+  "duplicate-id",
+  "missing-reference",
+  "unsupported-target",
+  "unavailable-capability",
+  "asymmetric-conflict",
+  "finalize-script",
+]);
+export type CatalogIssueCode = typeof CatalogIssueCode.Type;
+
+export const CatalogIssue = Schema.Struct({
+  subject: CatalogIssueSubject,
+  code: CatalogIssueCode,
+  message: Schema.String,
+  fragment: Schema.optionalKey(Schema.Int),
+});
+export type CatalogIssue = typeof CatalogIssue.Type;
+
+/** An interpreter capability outside the v1 set, or used without being declared. */
+export const CatalogCapabilityIssue = Schema.Struct({
+  subject: CatalogIssueSubject,
+  capability: Schema.String,
+});
+export type CatalogCapabilityIssue = typeof CatalogCapabilityIssue.Type;
+
 export class CatalogValidationError extends Data.TaggedError(
   "CatalogValidationError",
-)<{ readonly issues: ReadonlyArray<string> }> {
+)<{ readonly details: ReadonlyArray<CatalogIssue> }> {
+  get issues(): ReadonlyArray<string> {
+    return this.details.map((issue) => issue.message);
+  }
+
   override get message(): string {
     return `Invalid catalog: ${this.issues.join("; ")}`;
   }
@@ -396,7 +450,11 @@ export class CatalogValidationError extends Data.TaggedError(
 
 export class CatalogCapabilityError extends Data.TaggedError(
   "CatalogCapabilityError",
-)<{ readonly capabilities: ReadonlyArray<string> }> {
+)<{ readonly details: ReadonlyArray<CatalogCapabilityIssue> }> {
+  get capabilities(): ReadonlyArray<string> {
+    return [...new Set(this.details.map((issue) => issue.capability))];
+  }
+
   override get message(): string {
     return `Catalog requires unsupported or undeclared interpreter capabilities: ${this.capabilities.join(", ")}`;
   }
