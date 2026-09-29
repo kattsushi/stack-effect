@@ -7,15 +7,39 @@ import { graph } from "./commands/graph";
 import { init } from "./commands/init";
 import { parsePlanInput, ParsedPlanInput, plan } from "./commands/plan";
 import { schema } from "./commands/schema";
+import { selectionFromFlags, selectionFromProject } from "./lib/catalogSources";
 import { resolveNameAndRoot } from "./lib/project";
 import { ConfigureService } from "./service/ConfigureService";
-import { CommandServicesLayer } from "./services";
+import { commandServicesLayer } from "./services";
 
 const requireExistingConfig = (root: Option.Option<string>) =>
   Effect.gen(function* () {
     const configure = yield* ConfigureService;
     yield* configure.readConfig(Option.getOrElse(root, () => process.cwd()));
   });
+
+const projectConfig = (root: Option.Option<string>) =>
+  Effect.gen(function* () {
+    const configure = yield* ConfigureService;
+    return yield* configure
+      .readConfig(Option.getOrElse(root, () => process.cwd()))
+      .pipe(
+        Effect.asSome,
+        Effect.catchTag("MissingConfigError", () => Effect.succeedNone),
+      );
+  });
+
+/** The config at the project `init` or `create` would target, if one exists. */
+const targetProjectConfig = (
+  name: Option.Option<string>,
+  root: Option.Option<string>,
+) =>
+  Option.isNone(name)
+    ? Effect.succeedNone
+    : Effect.gen(function* () {
+        const { repoRoot } = yield* resolveNameAndRoot(name.value, root);
+        return yield* projectConfig(Option.some(repoRoot));
+      });
 
 const inspectProjectConfig = (
   name: Option.Option<string>,
@@ -38,31 +62,65 @@ export const stackEffectCommand = Command.make("stack-effect").pipe(
   ),
   Command.withSubcommands([
     init.pipe(
-      Command.provide(CommandServicesLayer),
+      Command.provide((flags) =>
+        commandServicesLayer(
+          selectionFromFlags(
+            flags.catalog,
+            targetProjectConfig(flags.name, flags.root),
+          ),
+        ),
+      ),
       Command.provideEffectDiscard((flags) =>
         inspectProjectConfig(flags.name, flags.root),
       ),
     ),
     create.pipe(
-      Command.provide(CommandServicesLayer),
+      Command.provide((flags) =>
+        commandServicesLayer(
+          selectionFromFlags(flags.catalog, Effect.succeedNone),
+        ),
+      ),
       Command.provideEffectDiscard((flags) =>
         inspectProjectConfig(flags.name, flags.root),
       ),
     ),
     add.pipe(
-      Command.provide(CommandServicesLayer),
+      Command.provide((flags) =>
+        commandServicesLayer(
+          selectionFromProject(flags.catalog, projectConfig(flags.root)),
+        ),
+      ),
       Command.provideEffectDiscard((flags) =>
         requireExistingConfig(flags.root),
       ),
     ),
-    graph.pipe(Command.provide(CommandServicesLayer)),
+    graph.pipe(
+      Command.provide((flags) =>
+        commandServicesLayer(
+          selectionFromProject(flags.catalog, projectConfig(flags.root)),
+        ),
+      ),
+    ),
     plan.pipe(
-      Command.provide(CommandServicesLayer),
+      Command.provide((flags) =>
+        commandServicesLayer(
+          selectionFromProject(
+            flags.catalog,
+            Effect.map(ParsedPlanInput, ({ config }) => Option.some(config)),
+          ),
+        ),
+      ),
       Command.provideEffect(ParsedPlanInput, (flags) =>
         parsePlanInput(flags.root),
       ),
     ),
-    schema.pipe(Command.provide(CommandServicesLayer)),
+    schema.pipe(
+      Command.provide((flags) =>
+        commandServicesLayer(
+          selectionFromProject(flags.catalog, projectConfig(flags.root)),
+        ),
+      ),
+    ),
     catalog,
   ]),
 );

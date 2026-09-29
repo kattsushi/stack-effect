@@ -28,7 +28,25 @@ type ResolvedScript = {
   readonly workdir: string;
   readonly phase: "finalize" | "config" | "post-finalize";
   readonly origin: string;
+  /** Selected catalog source that contributed the script, when sources are named. */
+  readonly source?: string;
 };
+
+/**
+ * Identifies one script for deduplication and selection. The source is part of
+ * the key, so a custom script can never stand in for an official one.
+ */
+export const scriptKey = (script: {
+  readonly command: string;
+  readonly workdir: string;
+  readonly source?: string | undefined;
+}) => `${script.source ?? ""}::${script.workdir}::${script.command}`;
+
+const sourceField = (source: Option.Option<string>) =>
+  Option.match(source, {
+    onNone: () => ({}),
+    onSome: (name) => ({ source: name }),
+  });
 
 export class FinalizeService extends Context.Service<FinalizeService>()(
   "FinalizeService",
@@ -58,6 +76,9 @@ export class FinalizeService extends Context.Service<FinalizeService>()(
               workdir: context.resolve(s.workdir ?? "{{targetPath}}"),
               phase: (s.phase ?? "finalize") as "finalize" | "post-finalize",
               origin: `target: ${node.identity.kind}`,
+              ...sourceField(
+                catalog.getSource({ _tag: "target", kind: node.identity.kind }),
+              ),
             }));
           }),
         ).pipe(Effect.map(Arr.flatten));
@@ -85,6 +106,9 @@ export class FinalizeService extends Context.Service<FinalizeService>()(
               workdir: context.resolve(s.workdir ?? "{{targetPath}}"),
               phase: (s.phase ?? "finalize") as "finalize" | "post-finalize",
               origin: `module: ${moduleNode.moduleId}`,
+              ...sourceField(
+                catalog.getSource({ _tag: "module", id: moduleNode.moduleId }),
+              ),
             }));
           }),
         ).pipe(Effect.map(Arr.flatten));
@@ -97,7 +121,7 @@ export class FinalizeService extends Context.Service<FinalizeService>()(
       ): ResolvedScript[] => {
         const seen = new Set<string>();
         return scripts.filter((s) => {
-          const key = `${s.command}::${s.workdir}`;
+          const key = scriptKey(s);
           if (seen.has(key)) return false;
           seen.add(key);
           return true;
@@ -128,11 +152,13 @@ export class FinalizeService extends Context.Service<FinalizeService>()(
         const scripts = yield* collectResolvedScripts(blueprint, config);
         const configScripts = buildConfigDerivedScripts(config);
         return orderScripts(deduplicateScripts(scripts), configScripts).map(
-          ({ label, command, phase, origin }) => ({
+          ({ label, command, workdir, phase, origin, source }) => ({
             label,
             command,
+            workdir,
             phase,
             origin,
+            ...(source === undefined ? {} : { source }),
           }),
         );
       });

@@ -22,7 +22,8 @@ import {
 import { Box } from "effect-boxes";
 import { Stdio } from "effect/Stdio";
 import { Command, Flag } from "effect/unstable/cli";
-import { rootFlag } from "../flags";
+import { catalogFlag, rootFlag } from "../flags";
+import { CatalogSelection, trustNotes } from "../service/CatalogSelection";
 import { ConfigureService } from "../service/ConfigureService";
 
 /**
@@ -75,23 +76,40 @@ export const parsePlanInput = (root: Option.Option<string>) =>
       Schema.fromJsonString(PlanRequest),
     )(stdin);
     const configure = yield* ConfigureService;
-    const config =
-      input.config ??
-      (yield* configure
-        .readConfig(repoRoot)
-        .pipe(
-          Effect.catchTag("MissingConfigError", () =>
-            Effect.fail(
+    const saved = yield* configure.readConfig(repoRoot).pipe(
+      Effect.asSome,
+      Effect.catchTag("MissingConfigError", () => Effect.succeedNone),
+    );
+    const savedCatalogs = Option.flatMap(saved, (config) =>
+      Option.fromUndefinedOr(config.catalogs),
+    );
+    // A stdin config without catalogs keeps the project's saved sources.
+    const config = yield* Option.match(Option.fromUndefinedOr(input.config), {
+      onNone: () =>
+        Effect.fromOption(saved).pipe(
+          Effect.mapError(
+            () =>
               "No config found. Provide 'config' in stdin or ensure stack.effect.json exists at --root.",
-            ),
           ),
-        ));
+        ),
+      onSome: (stdinConfig) =>
+        Effect.succeed(
+          stdinConfig.catalogs === undefined && Option.isSome(savedCatalogs)
+            ? stdinConfig.withCatalogs(savedCatalogs.value)
+            : stdinConfig,
+        ),
+    });
     return { input, config };
   });
 
 export const plan = Command.make(
   "plan",
-  { root: rootFlag, format: formatFlag, output: outputFlag },
+  {
+    root: rootFlag,
+    format: formatFlag,
+    output: outputFlag,
+    catalog: catalogFlag,
+  },
   (flags) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -99,6 +117,13 @@ export const plan = Command.make(
       const format = Option.getOrElse(flags.format, () => "llm" as const);
 
       const { input, config } = yield* ParsedPlanInput;
+      const { loaded } = yield* CatalogSelection;
+      const sources = loaded.map(({ name, sourceUrl, digest, freshness }) => ({
+        name,
+        url: sourceUrl,
+        digest,
+        freshness,
+      }));
 
       const blueprintService = yield* BlueprintService;
       const blueprint = yield* blueprintService.resolve(
@@ -123,10 +148,12 @@ export const plan = Command.make(
         .preview(blueprint, { repoRoot, config })
         .pipe(
           Effect.orElseSucceed(
-            () => [] as Array<{ label: string; command: string }>,
+            () =>
+              [] as Array<{ label: string; command: string; source?: string }>,
           ),
         );
 
+      const notes = trustNotes(scripts, loaded);
       const finalize = Arr.map(scripts, (script) => ({
         label: script.label,
         command: script.command,
@@ -168,18 +195,22 @@ export const plan = Command.make(
           ),
         ),
         Match.when("llm", () =>
-          Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(
-            renderPlanForLlm({
+          Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
+            sources,
+            notes,
+            ...renderPlanForLlm({
               outcomes: planResult.outcomes,
               conflicts: planResult.conflicts,
               finalize: finalizeWithCreateCommand,
               summary,
               tree,
             }),
-          ),
+          }),
         ),
         Match.when("raw", () =>
           Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
+            sources,
+            notes,
             baseline: planResult.baseline,
             outcomes: planResult.outcomes,
             conflicts: planResult.conflicts,
